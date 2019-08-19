@@ -1,15 +1,12 @@
-package com.af.framework.v2.servlet;
+package com.af.framework.v3.servlet;
 
 import com.af.framework.annotation.*;
-import com.sun.deploy.net.HttpResponse;
-import com.sun.xml.internal.ws.util.StringUtils;
 
 import javax.servlet.ServletConfig;
 import javax.servlet.ServletException;
 import javax.servlet.http.HttpServlet;
 import javax.servlet.http.HttpServletRequest;
 import javax.servlet.http.HttpServletResponse;
-import javax.xml.ws.RequestWrapper;
 import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
@@ -33,7 +30,9 @@ public class AfDispatcherServlet extends HttpServlet {
     //这里应该用包路径+类名。如果设置了value，就用value
     private Map<String, Object> ioc = new HashMap<>();
     //key-路径value-方法
-    private Map<String,Method> handlerMappingMap = new HashMap<>();
+    private Map<String, Method> handlerMappingMap = new HashMap<>();
+    //保存所有的Url和方法的映射关系
+    private List<Handler> handlerMapping = new ArrayList<Handler>();
 
     @Override
     protected void doGet(HttpServletRequest req, HttpServletResponse resp) throws ServletException, IOException {
@@ -46,65 +45,71 @@ public class AfDispatcherServlet extends HttpServlet {
         //派遣，分发任务
         try {
             //委派模式
-            doDispatcher(req,resp);
+            doDispatcher(req, resp);
         } catch (Exception e) {
             e.printStackTrace();
-            resp.getWriter().write("500 Excetion Detail:" +Arrays.toString(e.getStackTrace()));
+            resp.getWriter().write("500 Excetion Detail:" + Arrays.toString(e.getStackTrace()));
         }
     }
 
-    private void doDispatcher(HttpServletRequest request,HttpServletResponse response) throws Exception{
+    private Handler getHnandler(HttpServletRequest request) {
         //获取请求路径
         String requestURI = request.getRequestURI();
         //获取域名路径
         String contextPath = request.getContextPath();
         //抽取请求路径
         String url = requestURI.replaceAll(contextPath, "").replaceAll("/+", "/");
+        for (Handler handler : handlerMapping) {
+            if (handler.getUrl().equals(url)) {
+                return handler;
+            }
+        }
+        return null;
+
+    }
+
+    //url传过来的参数都是String类型的，HTTP是基于字符串协议
+    //只需要把String转换为任意类型就好
+    private Object convert(Class<?> type, String value) {
+        if (Integer.class == type) {
+            return Integer.valueOf(value);
+        }
+        //如果还有double或者其他类型，继续加if
+        //这时候，我们应该想到策略模式了
+        //在这里暂时不实现，希望小伙伴自己来实现
+        return value;
+    }
+
+    private void doDispatcher(HttpServletRequest request, HttpServletResponse response) throws Exception {
+
         //路径匹配
-        if(!handlerMappingMap.containsKey(url)){
+        Handler handler = getHnandler(request);
+        if (handler == null) {
             response.getWriter().write("404 Not Found!!");
             return;
         }
-        Map<String,String[]> params = request.getParameterMap();
-        //方法反射执行
-        Method method = handlerMappingMap.get(url);
-        //获取参数对象列表
-        Class<?>[] parameterTypes = method.getParameterTypes();
-        Object [] paramValues = new Object[parameterTypes.length];
-        for(int i = 0;i<parameterTypes.length;i++){
-            Class<?> parameterType = parameterTypes[i];
-            if(parameterType == HttpServletRequest.class){
-                paramValues[i] = request;
-                continue;
-            }else if(parameterType == HttpServletResponse.class){
-                paramValues[i] = response;
-                continue;
-            }else if(parameterType == String.class){
-                //传参类型
-                //提取加了注解的参数
-                Annotation[][] pa = method.getParameterAnnotations();
-                for(int j = 0 ;j < pa.length;j++){
-                    for(Annotation a : pa[j]){
-                        if(a instanceof AfRequestParam){
-                            String paramName = ((AfRequestParam) a).value();
-                            if(!"".equals(paramName.trim())){
-                                String value = Arrays.toString(params.get(paramName))
-                                        .replaceAll("\\[|\\]","")
-                                        .replaceAll("\\s",",");
-                                paramValues[i] = value;
-                            }
-                        }
-                    }
-                }
+        Class<?>[] types = handler.method.getParameterTypes();
 
+        Map<String, String[]> params = request.getParameterMap();
+        //赋值数组
+        Object[] paramValues = new Object[types.length];
+        for (Map.Entry<String, String[]> param : params.entrySet()) {
+            String value = Arrays.toString(param.getValue()).replaceAll("\\[|\\]", "").replaceAll(",\\s", ",");
+            //找到匹配对象 填充
+            if (!handler.paramIndexMapping.containsKey(param.getKey())) {
+                continue;
             }
+            Integer index = handler.paramIndexMapping.get(param.getKey());
+            paramValues[index] = convert(types[index], value);
         }
 
-        String beanName = toLowerFirstCase(method.getDeclaringClass().getSimpleName());
-        //此处应该加上对beanName的判断，包括ioc的获取
-        Method mt = handlerMappingMap.get(url);
-
-        mt.invoke(ioc.get(beanName),new Object[]{params.get("name")[0],request,response});
+        //设置方法中的request和response
+        //设置方法中的request和response对象
+        int reqIndex = handler.paramIndexMapping.get(HttpServletRequest.class.getName());
+        paramValues[reqIndex] = request;
+        int respIndex = handler.paramIndexMapping.get(HttpServletResponse.class.getName());
+        paramValues[respIndex] = response;
+        handler.method.invoke(handler.getController(), paramValues);
     }
 
     /**
@@ -130,36 +135,36 @@ public class AfDispatcherServlet extends HttpServlet {
 
     //将路径添加集合
     private void initHandlerMapping() {
-        if(ioc.isEmpty()){
+        if (ioc.isEmpty()) {
             return;
         }
         //收集方法
-        for(Map.Entry<String,Object> entry : ioc.entrySet()){
+        for (Map.Entry<String, Object> entry : ioc.entrySet()) {
             Object value = entry.getValue();
             Class<?> clazz = value.getClass();
-            if(!clazz.isAnnotationPresent(AfController.class)){
+            if (!clazz.isAnnotationPresent(AfController.class)) {
                 continue;
             }
             String baseUrl = "";//类名的路径
-            if(clazz.isAnnotationPresent(AfRequestMapper.class)){
+            if (clazz.isAnnotationPresent(AfRequestMapper.class)) {
                 AfRequestMapper annotation = clazz.getAnnotation(AfRequestMapper.class);
                 baseUrl = annotation.value();
             }
             //获取方法的路径
             //获取public方法
             Method[] methods = clazz.getMethods();
-            for(Method method : methods){
-                if(!method.isAnnotationPresent(AfRequestMapper.class)){
+            for (Method method : methods) {
+                if (!method.isAnnotationPresent(AfRequestMapper.class)) {
                     continue;
                 }
                 AfRequestMapper methodAno = method.getAnnotation(AfRequestMapper.class);
                 String methodUrl = methodAno.value();
-                if("".equals(methodUrl)){
+                if ("".equals(methodUrl)) {
                     continue;
                 }
                 String fullUrl = ("/" + baseUrl + "/" + methodUrl)
                         .replaceAll("/+", "/");
-                handlerMappingMap.put(fullUrl,method);
+                handlerMapping.add(new Handler(fullUrl, entry.getValue(), method));
                 System.out.println("Mapped " + fullUrl + "," + method);
             }
         }
@@ -167,21 +172,21 @@ public class AfDispatcherServlet extends HttpServlet {
 
     //注解字段赋值
     private void doAutowired() {
-        if(ioc.isEmpty()){
+        if (ioc.isEmpty()) {
             return;
         }
         //遍历ioc中的类，给每个类里面的注解字段赋值
-        for(Map.Entry<String,Object> entry : ioc.entrySet()){
+        for (Map.Entry<String, Object> entry : ioc.entrySet()) {
             //获取所有类型的字段
             Field[] fields = entry.getValue().getClass().getDeclaredFields();
-            for(Field field : fields){
-                if(!field.isAnnotationPresent(AfAutowired.class)){
+            for (Field field : fields) {
+                if (!field.isAnnotationPresent(AfAutowired.class)) {
                     continue;
                 }
                 AfAutowired fieldAno = field.getAnnotation(AfAutowired.class);
                 //判断默认值
                 String beanName = fieldAno.value().trim();
-                if("".equals(beanName)){
+                if ("".equals(beanName)) {
                     //TODO 应该用包路径+类名作为beanName，这样能避免不同包下的同类
                     beanName = toLowerFirstCase(field.getType().getSimpleName());
                 }
@@ -189,7 +194,7 @@ public class AfDispatcherServlet extends HttpServlet {
                 field.setAccessible(true);
                 //执行注入动作
                 try {
-                    field.set(entry.getValue(),ioc.get(beanName));
+                    field.set(entry.getValue(), ioc.get(beanName));
                 } catch (IllegalAccessException e) {
                     e.printStackTrace();
                     continue;
@@ -305,4 +310,65 @@ public class AfDispatcherServlet extends HttpServlet {
             }
         }
     }
+
+
+    //内部类，封装handler
+    private class Handler {
+        //url
+        private String url;
+        private Object controller;
+        private Method method;
+
+        public String getUrl() {
+            return url;
+        }
+
+        public Object getController() {
+            return controller;
+        }
+
+        public Method getMethod() {
+            return method;
+        }
+
+        //参数顺序
+        private Map<String, Integer> paramIndexMapping;
+
+        protected Handler(String url, Object controller, Method method) {
+            this.url = url;
+            this.controller = controller;
+            this.method = method;
+            paramIndexMapping = new HashMap<>();
+            //封装数据
+            putParamIndexMapper(method);
+        }
+
+        //对数据进行封装
+        private void putParamIndexMapper(Method method) {
+            Annotation[][] pa = method.getParameterAnnotations();
+            for (int i = 0; i < pa.length; i++) {
+                Annotation[] annotations = pa[i];
+                for (Annotation a : annotations) {
+                    if (a instanceof AfRequestParam) {
+                        String paramName = ((AfRequestParam) a).value();
+                        if (!"".equals(paramName.trim())) {
+                            paramIndexMapping.put(paramName, i);
+                        }
+                    }
+                }
+            }
+
+            //对没有注解的参数处理,例如HttpServletRequest这种
+            Class<?>[] parameterTypes = method.getParameterTypes();
+            for (int i = 0; i < parameterTypes.length; i++) {
+                Class<?> parameterType = parameterTypes[i];
+                if (parameterType == HttpServletRequest.class ||
+                        parameterType == HttpServletResponse.class) {
+                    paramIndexMapping.put(parameterType.getName(), i);
+                }
+            }
+
+        }
+    }
+
 }
